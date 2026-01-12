@@ -7,52 +7,22 @@
 #   against checksum metadata stored in iRODS. It verifies data integrity at
 #   the content level, not just filenames or sizes.
 #
-# WHAT THE SCRIPT DOES
-#   1) Ensures iRODS checksums are registered (ichksum -r)
-#   2) Builds a local manifest using SHA-256 (Base64-encoded)
-#   3) Queries iRODS for stored checksums
-#   4) Normalizes both file path lists
-#   5) Compares manifests and reports discrepancies
-#
-# TYPICAL USE CASES
-#   • Validation after ingest or upload to iRODS
-#   • Periodic data integrity audits
-#   • Verification before archival or deletion
-#   • Quality control in research data management workflows
-#
-# REQUIREMENTS
-#   iRODS client tools:
-#       ipwd, ichksum, iquest
-#   Standard Unix utilities:
-#       sha256sum, base64, awk, diff, sort, xxd, mktemp, find
-#
 # USAGE
 #   ./irods-verify-checksums.sh [options]
-#
 # OPTIONS
 #   -l PATH    Local directory to verify
 #   -c PATH    iRODS collection path
-#   -h         Show help text
+#   -h         Show this help text
 #
 # EXAMPLES
-#   Verify using defaults configured inside the script:
-#       ./irods-verify-checksums.sh
-#
-#   Verify explicit directory and iRODS collection:
-#       ./irods-verify-checksums.sh -l /data/projectA -c zone/home/projectA
-#
-#   Display help:
-#       ./irods-verify-checksums.sh -h
+#   ./irods-verify-checksums.sh
+#   ./irods-verify-checksums.sh -l /data/projectA -c zone/home/projectA
+#   ./irods-verify-checksums.sh -h
 #
 # EXIT STATUS
-#       0  verification successful (all files match)
+#       0  verification successful
 #       1  mismatches detected
-#       2  validation or execution error
-#
-# NOTES
-#   • Only regular files are processed
-#   • Relative paths are normalized and prefixed with "./"
-#   • Designed for bash; uses bash-only features (arrays, pipefail, process substitution)
+#       2  execution error
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -64,27 +34,11 @@ IRODS_COLLECTION="LMIB/Saptarshi/HPC_intro"
 
 usage() {
     cat <<'EOF'
-Verify integrity of a local directory against checksum metadata stored in iRODS.
-
+Usage: ./irods-verify-checksums.sh [options]
 Options:
   -l PATH    Local directory to verify
   -c PATH    iRODS collection path
-  -h         Show this help text and exit
-
-Examples:
-  # Use defaults configured in the script
-  ./irods-verify-checksums.sh
-
-  # Verify custom local directory and iRODS collection
-  ./irods-verify-checksums.sh -l /data/projectA -c zone/home/projectA
-
-  # Show help
-  ./irods-verify-checksums.sh -h
-
-Exit codes:
-  0  verification successful (all files match)
-  1  mismatches detected
-  2  failure during execution or validation error
+  -h         Show this help text
 EOF
 }
 
@@ -112,19 +66,13 @@ for cmd in "${required_cmds[@]}"; do
 done
 
 # ------------------------- INPUT VALIDATION -------------------------
-if [ ! -d "$LOCAL_DIR" ]; then
-    log_error "Local directory not found or not accessible: $LOCAL_DIR"
-    exit 2
-fi
+[ -d "$LOCAL_DIR" ] || { log_error "Local directory not found: $LOCAL_DIR"; exit 2; }
 
 # ------------------------- TEMP FILES -------------------------------
 LOCAL_MANIFEST=$(mktemp)
 IRODS_MANIFEST=$(mktemp)
 IRODS_RAW=$(mktemp)
-
-cleanup() {
-    rm -f "$LOCAL_MANIFEST" "$IRODS_MANIFEST" "$IRODS_RAW"
-}
+cleanup() { rm -f "$LOCAL_MANIFEST" "$IRODS_MANIFEST" "$IRODS_RAW"; }
 trap cleanup EXIT INT TERM
 
 # ------------------------- MAIN PROCESS -----------------------------
@@ -140,11 +88,25 @@ ichksum -r "$IRODS_COLLECTION" >/dev/null
 # ------------------------- LOCAL MANIFEST ---------------------------
 log_info "Building local manifest from directory: $LOCAL_DIR"
 
-while IFS= read -r -d '' file; do
+TOTAL_FILES=$(find "$LOCAL_DIR" -type f | wc -l)
+CURRENT=0
+START_TIME=$SECONDS
+
+find "$LOCAL_DIR" -type f -print0 | while IFS= read -r -d '' file; do
+    CURRENT=$((CURRENT+1))
     rel_path="./${file#$LOCAL_DIR/}"
     hash=$(sha256sum "$file" | awk '{print $1}' | xxd -r -p | base64 | tr -d '\n')
     printf "%s  %s\n" "$hash" "$rel_path" >>"$LOCAL_MANIFEST"
+
+    ELAPSED=$((SECONDS - START_TIME))
+    if [ "$CURRENT" -gt 0 ]; then
+        AVG_TIME_PER_FILE=$(echo "$ELAPSED / $CURRENT" | bc -l)
+        REMAINING_EST=$(printf "%.0f" $(echo "$AVG_TIME_PER_FILE * ($TOTAL_FILES - $CURRENT)" | bc -l))
+        printf '\r[INFO] Local manifest: %d/%d files processed (~%ds remaining)' \
+            "$CURRENT" "$TOTAL_FILES" "$REMAINING_EST"
+    fi
 done < <(find "$LOCAL_DIR" -type f -print0)
+printf '\n'
 
 sort -k2 -o "$LOCAL_MANIFEST" "$LOCAL_MANIFEST"
 
@@ -154,9 +116,16 @@ log_info "Querying iRODS and building manifest"
 QUERY1="SELECT COLL_NAME, DATA_NAME, DATA_CHECKSUM WHERE COLL_NAME = '$IRODS_ABS_PATH'"
 QUERY2="SELECT COLL_NAME, DATA_NAME, DATA_CHECKSUM WHERE COLL_NAME LIKE '$IRODS_ABS_PATH/%'"
 
-for Q in "$QUERY1" "$QUERY2"; do
+IRODS_QUERIES=("$QUERY1" "$QUERY2")
+TOTAL_QUERIES=${#IRODS_QUERIES[@]}
+CURRENT_QUERY=0
+
+for Q in "${IRODS_QUERIES[@]}"; do
+    CURRENT_QUERY=$((CURRENT_QUERY+1))
     iquest '%s/%s|%s' "$Q" 2>/dev/null | grep '|' >>"$IRODS_RAW" || true
+    printf '\r[INFO] iRODS manifest: query %d/%d completed' "$CURRENT_QUERY" "$TOTAL_QUERIES"
 done
+printf '\n'
 
 awk -v root="$IRODS_ABS_PATH" -F'|' '
 {
@@ -166,10 +135,7 @@ awk -v root="$IRODS_ABS_PATH" -F'|' '
     print $2 "  " $1
 }' "$IRODS_RAW" | sort -k2 >"$IRODS_MANIFEST"
 
-if [ ! -s "$IRODS_MANIFEST" ]; then
-    log_error "No data found in iRODS manifest; path may be incorrect or inaccessible"
-    exit 2
-fi
+[ -s "$IRODS_MANIFEST" ] || { log_error "iRODS manifest empty"; exit 2; }
 
 # ------------------------- COMPARISON -------------------------------
 log_info "Comparing manifests"
